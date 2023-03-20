@@ -19,21 +19,43 @@ services:
       - osm-tiles:/data/tiles:ro
 
   renderd:
-    entrypoint: /docker-entrypoint.sh
+    build:
+      args:
+        mod_tile_ref: CMakeGenerateConfigsAndDirectories
+        mod_tile_repo: https://github.com/hummeltech/mod_tile.git
+      dockerfile: Dockerfile.renderd
+    depends_on:
+      postgres:
+        condition: service_healthy
     environment:
       DOWNLOAD_PBF: https://download.geofabrik.de/europe/germany/hamburg-latest.osm.pbf
       DOWNLOAD_POLY: https://download.geofabrik.de/europe/germany/hamburg.poly
-    healthcheck:
-      test: ["CMD", "/docker-healthcheck.sh"]
-      start_period: 30m
-    image: overv/openstreetmap-tile-server
+      G_MESSAGES_DEBUG: ${G_MESSAGES_DEBUG:-info}
+      PGHOST: postgres
+      PGUSER: gis
     volumes:
-      - ./renderd-entrypoint.sh:/docker-entrypoint.sh:ro
-      - ./renderd-healthcheck.sh:/docker-healthcheck.sh:ro
-      - osm-data:/data/database/:rw
+      - osm-data:/data:rw
       - osm-tiles:/data/tiles:rw
+
+  postgres:
+    environment:
+      PGDATA: /data/database
+      POSTGRES_DB: gis
+      POSTGRES_HOST_AUTH_METHOD: trust
+      POSTGRES_USER: gis
+    healthcheck:
+      start_period: 5m
+      test: ["CMD", "pg_isready", "--username", "gis"]
+    image: postgis/postgis:15-3.3-alpine
+    volumes:
+      - ./postgres-20_hstore.sh:/docker-entrypoint-initdb.d/20_hstore.sh
+      - ./postgres-30_tuning.sh:/docker-entrypoint-initdb.d/30_tuning.sh
+      - osm-database:/data/database
+
 volumes:
   osm-data:
+    driver: local
+  osm-database:
     driver: local
   osm-tiles:
     driver: local

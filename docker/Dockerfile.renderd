@@ -1,0 +1,137 @@
+ARG carto_version=1.2.0
+ARG mod_tile_ref=master
+ARG mod_tile_repo=https://github.com/openstreetmap/mod_tile.git
+ARG openstreetmap_carto_ref=v5.7.0
+
+# mod_tile builder
+FROM archlinux as mod_tile-builder
+ARG mod_tile_ref
+ARG mod_tile_repo
+RUN --mount=target=/var/cache/pacman,type=cache,sharing=locked \
+    pacman --sync --refresh --sysupgrade --noconfirm \
+        apache \
+        apr \
+        boost \
+        cairo \
+        cmake \
+        curl \
+        extra-cmake-modules \
+        gcc \
+        git \
+        glib2 \
+        iniparser \
+        libmemcached \
+        make \
+        mapnik \
+        memcached \
+        pkgconf
+RUN git clone --branch ${mod_tile_ref} --depth 1 ${mod_tile_repo} /tmp/mod_tile_src
+WORKDIR /tmp/mod_tile_src
+RUN export CMAKE_BUILD_PARALLEL_LEVEL=$(nproc) && \
+    cmake -B build -S /tmp/mod_tile_src -DCMAKE_BUILD_TYPE:STRING=Release && \
+    cmake --build build
+RUN export DESTDIR=/tmp/mod_tile && \
+    cmake --install build --prefix /usr --strip && \
+    mv /tmp/mod_tile/var/run /tmp/mod_tile/run
+
+
+# openstreetmap-carto builder
+FROM archlinux as openstreetmap-carto-build
+ARG carto_version
+ARG openstreetmap_carto_ref
+RUN --mount=target=/var/cache/pacman,type=cache,sharing=locked \
+    pacman --sync --refresh --sysupgrade --noconfirm \
+        curl \
+        git \
+        npm \
+        unzip
+RUN git clone --branch ${openstreetmap_carto_ref} --depth 1 https://github.com/gravitystorm/openstreetmap-carto.git /tmp/openstreetmap-carto_src
+WORKDIR /tmp/openstreetmap-carto_src
+RUN scripts/get-fonts.sh
+RUN npm --global install carto@${carto_version} && \
+    carto project.mml > mapnik.xml
+WORKDIR /tmp/openstreetmap-carto_src/data
+RUN for URL in $(grep "url: " ../external-data.yml | awk '{print $2}'); \
+    do \
+        curl --location --remote-name --silent ${URL}; \
+        echo -n "$(date --utc '+%a, %d %b %Y %T GMT')" > $(basename ${URL}).lastmod; \
+    done
+
+
+# osm2pgsql builder
+FROM archlinux as osm2pgsql-builder
+RUN --mount=target=/var/cache/pacman,type=cache,sharing=locked \
+    pacman --sync --refresh --sysupgrade --noconfirm \
+        base-devel \
+        boost \
+        boost-libs \
+        cmake \
+        expat \
+        geos \
+        git \
+        lua \
+        postgresql-libs \
+        proj \
+        zlib
+USER nobody
+RUN git clone --depth 1 https://aur.archlinux.org/osm2pgsql.git /tmp/osm2pgsql_build
+WORKDIR /tmp/osm2pgsql_build
+RUN export CMAKE_BUILD_PARALLEL_LEVEL=$(nproc) && \
+    makepkg --nocheck
+
+
+# mod_tile runner
+FROM archlinux as mod_tile-runner
+RUN --mount=target=/var/cache/pacman,type=cache,sharing=locked \
+    pacman --sync --refresh --sysupgrade --noconfirm \
+        arrow \
+        boost \
+        cairo \
+        cfitsio \
+        curl \
+        glib2 \
+        hdf5 \
+        iniparser \
+        libheif \
+        libjxl \
+        libmemcached \
+        lua \
+        mapnik \
+        mariadb-libs \
+        netcdf \
+        openexr \
+        openjpeg2 \
+        podofo \
+        poppler \
+        python \
+        python-psycopg2 \
+        python-requests \
+        python-yaml
+RUN useradd --no-create-home --shell /usr/bin/nologin --user-group renderd
+
+## Copy files from mod_tile-builder
+COPY --from=mod_tile-builder /tmp/mod_tile /
+RUN chown renderd:renderd /var/cache/renderd /var/run/renderd
+
+## Copy files from openstreetmap-carto-build
+COPY --from=openstreetmap-carto-build /tmp/openstreetmap-carto_src/data /usr/share/openstreetmap-carto/data
+COPY --from=openstreetmap-carto-build /tmp/openstreetmap-carto_src/external-data.yml /usr/share/openstreetmap-carto/external-data.yml
+COPY --from=openstreetmap-carto-build /tmp/openstreetmap-carto_src/fonts /usr/share/openstreetmap-carto/fonts
+COPY --from=openstreetmap-carto-build /tmp/openstreetmap-carto_src/indexes.sql /usr/share/openstreetmap-carto/indexes.sql
+COPY --from=openstreetmap-carto-build /tmp/openstreetmap-carto_src/mapnik.xml /usr/share/openstreetmap-carto/mapnik.xml
+COPY --from=openstreetmap-carto-build /tmp/openstreetmap-carto_src/openstreetmap-carto.lua /usr/share/openstreetmap-carto/openstreetmap-carto.lua
+COPY --from=openstreetmap-carto-build /tmp/openstreetmap-carto_src/openstreetmap-carto.style /usr/share/openstreetmap-carto/openstreetmap-carto.style
+COPY --from=openstreetmap-carto-build /tmp/openstreetmap-carto_src/patterns /usr/share/openstreetmap-carto/patterns
+COPY --from=openstreetmap-carto-build /tmp/openstreetmap-carto_src/scripts/get-external-data.py /usr/share/openstreetmap-carto/scripts/get-external-data.py
+COPY --from=openstreetmap-carto-build /tmp/openstreetmap-carto_src/symbols /usr/share/openstreetmap-carto/symbols
+
+## Copy files from osm2pgsql-builder
+COPY --from=osm2pgsql-builder /tmp/osm2pgsql_build/osm2pgsql-*.pkg.tar.zst /tmp/
+RUN pacman --upgrade --noconfirm /tmp/osm2pgsql-*.pkg.tar.zst && \
+    rm /tmp/osm2pgsql-*.pkg.tar.zst
+
+COPY ./renderd-entrypoint.sh /docker-entrypoint.sh
+COPY ./renderd-healthcheck.sh /docker-healthcheck.sh
+
+ENTRYPOINT /docker-entrypoint.sh
+HEALTHCHECK --start-period=60m CMD /docker-healthcheck.sh
