@@ -226,10 +226,10 @@ func main() {
 	}
 
 	// HTTP request multiplexer
-	mux := http.NewServeMux()
+	httpServeMux := http.NewServeMux()
 
 	// Tile HTTP request handler
-	mux.HandleFunc("/tile/", func(w http.ResponseWriter, r *http.Request) {
+	httpServeMux.HandleFunc("/tile/", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != "GET" {
 			http.Error(w, "Only GET requests allowed", http.StatusMethodNotAllowed)
 			return
@@ -238,11 +238,11 @@ func main() {
 	})
 
 	// Static HTTP request handler
-	mux.Handle("/", http.FileServer(http.Dir(*static_dir)))
+	httpServeMux.Handle("/", http.FileServer(http.Dir(*static_dir)))
 
 	// HTTP Server
-	server := &http.Server{
-		Handler: mux,
+	httpServer := http.Server{
+		Handler: httpServeMux,
 	}
 
 	// HTTPS listener
@@ -258,7 +258,7 @@ func main() {
 			} else {
 				fmt.Printf("Started HTTPS listener on %s\n", httpsAddr)
 			}
-			err = server.ServeTLS(httpsListener, *tls_cert_path, *tls_key_path)
+			err = httpServer.ServeTLS(httpsListener, *tls_cert_path, *tls_key_path)
 			if err != nil {
 				log.Fatalf("Failed to start HTTPS server: %v", err)
 			}
@@ -278,7 +278,7 @@ func main() {
 	} else {
 		fmt.Printf("Started HTTP listener on %s\n", httpAddr)
 	}
-	err = server.Serve(httpListener)
+	err = httpServer.Serve(httpListener)
 	if err != nil {
 		log.Fatalf("Failed to start HTTP server: %v", err)
 	}
