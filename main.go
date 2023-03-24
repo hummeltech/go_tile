@@ -6,13 +6,14 @@ import (
 	"flag"
 	"fmt"
 	"io"
-	"log"
 	"net"
 	"net/http"
 	"os"
 	"regexp"
 	"strconv"
 	"time"
+
+	klog "k8s.io/klog/v2"
 )
 
 /*
@@ -98,8 +99,7 @@ func writeTileResponse(writer http.ResponseWriter, req *http.Request, metatile_p
 		if errors.Is(err, os.ErrNotExist) {
 			writer.WriteHeader(http.StatusNotFound)
 		} else {
-			fmt.Println("Could not open file!", metatile_path)
-			fmt.Println(err)
+			klog.Warningf("Could not open file %s: %v", metatile_path, err)
 			writer.WriteHeader(http.StatusInternalServerError)
 		}
 		return nil
@@ -146,18 +146,18 @@ func handleRequest(resp http.ResponseWriter, req *http.Request, data_dir, map_na
 	if statErr != nil {
 		if errors.Is(statErr, os.ErrNotExist) {
 			if len(renderd_socket) == 0 {
-				fmt.Printf("Tile not found: %s\n", metatile_path)
+				klog.Warningf("Metatile does not exist: %s", metatile_path)
 				resp.WriteHeader(http.StatusNotFound)
 				return
 			}
 			renderErr := requestRender(x, y, z, map_name, renderd_socket, renderd_timeout, 5)
 			if renderErr != nil {
-				fmt.Printf("Could not generate tile for coordinates %d, %d, %d (x,y,z). '%s'\n", x, y, z, renderErr)
+				klog.Warningf("Could not generate tile for coordinates %d, %d, %d (x,y,z). '%s'", x, y, z, renderErr)
 				// Not returning as we are hoping and praying that rendering did nonetheless produce a file
 			}
 			if fileInfo, statErr = os.Stat(metatile_path); statErr != nil {
 				if renderErr == nil {
-					fmt.Printf("warning: metatile could not be found after successful render. Are the paths matching? Tried %s\n", metatile_path)
+					klog.Warningf("Metatile could not be found after successful render. Are the paths matching? Tried %s", metatile_path)
 				}
 				// we haven't checked if this was actually a NotFound error, and even then, this is not a client error, so a 5xx is warranted
 				resp.WriteHeader(http.StatusInternalServerError)
@@ -200,29 +200,41 @@ func main() {
 	tls_cert_path := flag.String("tls_cert_path", "", "Path to TLS certificate")
 	tls_key_path := flag.String("tls_key_path", "", "Path to TLS key")
 	tile_expiration_duration := flag.Duration("tile_expiration", 0, "Duration after which tiles are considered stale (I.E. '168h' for one week). Tile expiration disabled by default")
+	verbosity := flag.Int("verbosity", 0, "Number for the log level verbosity")
+
 	flag.Parse()
+
+	// Only allow setting klog's verbosity flag
+	var klogFlags flag.FlagSet
+	klog.InitFlags(&klogFlags)
+	klogFlags.Set("v", fmt.Sprintf("%d", *verbosity))
+
 	// Renderd expects at most 64 bytes.
 	// 64 - (5 * 4 bytes - 1 zero byte of null-terminated string) = 43
 	if len(*map_name) > 43 {
-		log.Fatal("Map name may not be longer than 43 characters")
+		klog.Fatal("Map name may not be longer than 43 characters")
 	}
 	if len(*renderd_socket) > 0 {
 		renderd_socket_type, renderd_tcp_addr := getSocketType(*renderd_socket)
 		if renderd_socket_type == "tcp" {
 			c, err := net.DialTCP("tcp", nil, renderd_tcp_addr)
 			if err != nil {
-				log.Fatalf("There was an error with the renderd %s socket at '%s': %v", renderd_socket_type, *renderd_socket, err)
+				klog.Fatalf("There was an error with the renderd %s socket at '%s': %v", renderd_socket_type, *renderd_socket, err)
 			}
 			c.Close()
 		} else {
 			_, err := os.Stat(*renderd_socket)
 			if err != nil {
-				log.Fatalf("There was an error with the renderd %s socket at '%s': %v", renderd_socket_type, *renderd_socket, err)
+				klog.Fatalf("There was an error with the renderd %s socket at '%s': %v", renderd_socket_type, *renderd_socket, err)
 			}
 		}
-		fmt.Printf("Using renderd %s socket at '%s'\n", renderd_socket_type, *renderd_socket)
+		if klog.V(1).Enabled() {
+			klog.Infof("Using renderd %s socket at '%s'\n", renderd_socket_type, *renderd_socket)
+		}
 	} else {
-		fmt.Println("Rendering is disabled")
+		if klog.V(1).Enabled() {
+			klog.Infof("Rendering is disabled")
+		}
 	}
 
 	// HTTP request multiplexer
@@ -230,6 +242,9 @@ func main() {
 
 	// Tile HTTP request handler
 	httpServeMux.HandleFunc("/tile/", func(w http.ResponseWriter, r *http.Request) {
+		if klog.V(2).Enabled() {
+			klog.Infof("%s request received: %s", r.Method, r.RequestURI)
+		}
 		if r.Method != "GET" {
 			http.Error(w, "Only GET requests allowed", http.StatusMethodNotAllowed)
 			return
@@ -250,36 +265,38 @@ func main() {
 		go func() {
 			httpsAddr, err := net.ResolveTCPAddr("tcp", fmt.Sprintf("%s:%d", *http_listen_host, *https_listen_port))
 			if err != nil {
-				log.Fatalf("Failed to resolve TCP address: %v", err)
+				klog.Fatalf("Failed to resolve TCP address: %v", err)
 			}
 			httpsListener, err := net.ListenTCP("tcp", httpsAddr)
 			if err != nil {
-				log.Fatalf("Failed to start TCP listener: %v", err)
+				klog.Fatalf("Failed to start TCP listener: %v", err)
 			} else {
-				fmt.Printf("Started HTTPS listener on %s\n", httpsAddr)
+				klog.Infof("Started HTTPS listener on %s\n", httpsAddr)
 			}
 			err = httpServer.ServeTLS(httpsListener, *tls_cert_path, *tls_key_path)
 			if err != nil {
-				log.Fatalf("Failed to start HTTPS server: %v", err)
+				klog.Fatalf("Failed to start HTTPS server: %v", err)
 			}
 		}()
 	} else {
-		fmt.Println("TLS is disabled")
+		if klog.V(1).Enabled() {
+			klog.Infof("TLS is disabled")
+		}
 	}
 
 	// HTTP listener
 	httpAddr, err := net.ResolveTCPAddr("tcp", fmt.Sprintf("%s:%d", *http_listen_host, *http_listen_port))
 	if err != nil {
-		log.Fatalf("Failed to resolve TCP address: %v", err)
+		klog.Fatalf("Failed to resolve TCP address: %v", err)
 	}
 	httpListener, err := net.ListenTCP("tcp", httpAddr)
 	if err != nil {
-		log.Fatalf("Failed to start TCP listener: %v", err)
+		klog.Fatalf("Failed to start TCP listener: %v", err)
 	} else {
-		fmt.Printf("Started HTTP listener on %s\n", httpAddr)
+		klog.Infof("Started HTTP listener on %s\n", httpAddr)
 	}
 	err = httpServer.Serve(httpListener)
 	if err != nil {
-		log.Fatalf("Failed to start HTTP server: %v", err)
+		klog.Fatalf("Failed to start HTTP server: %v", err)
 	}
 }
